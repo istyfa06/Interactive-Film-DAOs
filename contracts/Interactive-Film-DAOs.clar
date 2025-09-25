@@ -12,9 +12,13 @@
 (define-constant err-already-voted (err u105))
 (define-constant err-insufficient-tokens (err u106))
 (define-constant err-proposal-executed (err u107))
+(define-constant err-invalid-delegate (err u108))
+(define-constant err-self-delegation (err u109))
+(define-constant err-already-delegated (err u110))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var total-supply uint u1000000)
+(define-data-var next-delegate-id uint u1)
 
 (define-map proposals
   uint
@@ -45,6 +49,33 @@
 (define-map token-holders
   principal
   { balance: uint, voting-power: uint }
+)
+
+(define-map delegates
+  uint
+  {
+    delegate-address: principal,
+    reputation-score: uint,
+    total-delegated-power: uint,
+    successful-proposals: uint,
+    total-proposals: uint,
+    active: bool,
+    bio: (string-ascii 200)
+  }
+)
+
+(define-map delegations
+  principal
+  {
+    delegate-id: uint,
+    delegated-power: uint,
+    active: bool
+  }
+)
+
+(define-map delegate-by-address
+  principal
+  { delegate-id: uint }
 )
 
 (define-map characters
@@ -129,8 +160,12 @@
     (voter-balance (get balance (default-to { balance: u0, voting-power: u0 } 
                      (map-get? token-holders tx-sender))))
     (existing-vote (map-get? votes { proposal-id: proposal-id, voter: tx-sender }))
+    (delegation (map-get? delegations tx-sender))
+    (effective-power (if (is-some delegation)
+                       (get delegated-power (unwrap-panic delegation))
+                       voter-balance))
   )
-    (asserts! (>= voter-balance token-amount) err-insufficient-tokens)
+    (asserts! (>= effective-power token-amount) err-insufficient-tokens)
     (asserts! (>= voter-balance u10) err-not-token-holder)
     (asserts! (<= stacks-block-height (get end-block proposal)) err-voting-ended)
     (asserts! (is-none existing-vote) err-already-voted)
@@ -261,6 +296,106 @@
   )
 )
 
+(define-public (register-as-delegate (bio (string-ascii 200)))
+  (let (
+    (delegate-id (var-get next-delegate-id))
+    (token-balance (get balance (default-to { balance: u0, voting-power: u0 } 
+                     (map-get? token-holders tx-sender))))
+  )
+    (asserts! (>= token-balance u1000) err-insufficient-tokens)
+    (asserts! (is-none (map-get? delegate-by-address tx-sender)) err-already-delegated)
+    
+    (map-set delegates delegate-id {
+      delegate-address: tx-sender,
+      reputation-score: u100,
+      total-delegated-power: u0,
+      successful-proposals: u0,
+      total-proposals: u0,
+      active: true,
+      bio: bio
+    })
+    
+    (map-set delegate-by-address tx-sender { delegate-id: delegate-id })
+    
+    (var-set next-delegate-id (+ delegate-id u1))
+    (ok delegate-id)
+  )
+)
+
+(define-public (delegate-voting-power (delegate-id uint) (power-amount uint))
+  (let (
+    (delegate-info (unwrap! (map-get? delegates delegate-id) err-invalid-delegate))
+    (delegator-balance (get balance (default-to { balance: u0, voting-power: u0 } 
+                         (map-get? token-holders tx-sender))))
+    (existing-delegation (map-get? delegations tx-sender))
+  )
+    (asserts! (not (is-eq tx-sender (get delegate-address delegate-info))) err-self-delegation)
+    (asserts! (is-none existing-delegation) err-already-delegated)
+    (asserts! (>= delegator-balance power-amount) err-insufficient-tokens)
+    (asserts! (get active delegate-info) err-invalid-delegate)
+    
+    (map-set delegations tx-sender {
+      delegate-id: delegate-id,
+      delegated-power: power-amount,
+      active: true
+    })
+    
+    (map-set delegates delegate-id
+      (merge delegate-info {
+        total-delegated-power: (+ (get total-delegated-power delegate-info) power-amount)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-delegation)
+  (let (
+    (delegation (unwrap! (map-get? delegations tx-sender) err-invalid-delegate))
+    (delegate-id (get delegate-id delegation))
+    (delegate-info (unwrap! (map-get? delegates delegate-id) err-invalid-delegate))
+    (delegated-power (get delegated-power delegation))
+  )
+    (asserts! (get active delegation) err-invalid-delegate)
+    
+    (map-set delegations tx-sender
+      (merge delegation { active: false })
+    )
+    
+    (map-set delegates delegate-id
+      (merge delegate-info {
+        total-delegated-power: (- (get total-delegated-power delegate-info) delegated-power)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-delegate-reputation (delegate-id uint) (successful bool))
+  (let (
+    (delegate-info (unwrap! (map-get? delegates delegate-id) err-invalid-delegate))
+    (new-successful (if successful (+ (get successful-proposals delegate-info) u1) (get successful-proposals delegate-info)))
+    (new-total (+ (get total-proposals delegate-info) u1))
+    (new-reputation (if (> new-total u0) 
+                      (/ (* new-successful u100) new-total)
+                      u100))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    (map-set delegates delegate-id
+      (merge delegate-info {
+        successful-proposals: new-successful,
+        total-proposals: new-total,
+        reputation-score: new-reputation
+      })
+    )
+    
+    (ok new-reputation)
+  )
+)
+
 (define-read-only (get-proposal (proposal-id uint))
   (map-get? proposals proposal-id)
 )
@@ -300,6 +435,18 @@
 
 (define-read-only (get-total-supply)
   (ft-get-supply film-token)
+)
+
+(define-read-only (get-delegate (delegate-id uint))
+  (map-get? delegates delegate-id)
+)
+
+(define-read-only (get-delegation (delegator principal))
+  (map-get? delegations delegator)
+)
+
+(define-read-only (get-delegate-by-address (address principal))
+  (map-get? delegate-by-address address)
 )
 
 (begin
